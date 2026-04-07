@@ -41,22 +41,47 @@ def update_unrealized_pnl() -> dict:
     return {"status": "success", "updated_holdings_count": updated_count}
 
 
-@celery_app.task(name="app.tasks.sync.take_daily_snapshot")
-def take_daily_snapshot() -> dict:
+@celery_app.task(name="app.tasks.sync.compute_end_of_day_analytics")
+def compute_end_of_day_analytics() -> dict:
     """
-    Take a daily portfolio snapshot for all active users.
-    Triggered by Celery Beat at 3:35 PM IST each trading day.
+    Computes daily PnL and snapshots for all active users.
+    Triggered by Celery Beat at EOD.
     """
     import asyncio
-    from app.database import SessionLocal
+    import pytz
+    from datetime import datetime
+    from sqlalchemy import select
+    from app.database import AsyncSessionLocal
     from app.db.crud_analytics import compute_and_save_snapshots
+    from app.engine.pnl_engine import compute_daily_total_pnl
+    from app.models.user import User
     
     async def run():
-        async with SessionLocal() as db:
+        async with AsyncSessionLocal() as db:
+            users = (await db.execute(select(User))).scalars().all()
+            for u in users:
+                try:
+                    tz = pytz.timezone(u.timezone)
+                except Exception:
+                    tz = pytz.UTC
+                local_today = datetime.now(tz).date()
+                
+                # Daily PnL for Unrealized + Realized updates
+                await compute_daily_total_pnl(db, u.id, local_today)
+            
+            # Daily Portfolio Snapshot
             count = await compute_and_save_snapshots(db)
             return count
 
-    loop = asyncio.get_event_loop()
-    snapshot_count = loop.run_until_complete(run())
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+        
+    if loop and loop.is_running():
+        # Fallback if running inside an existing loop (fastapi tests, etc)
+        snapshot_count = asyncio.ensure_future(run())
+    else:
+        snapshot_count = asyncio.run(run())
     
     return {"status": "success", "snapshots_created": snapshot_count}

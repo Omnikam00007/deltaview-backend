@@ -66,6 +66,22 @@ async def get_trade(
     return trade
 
 
+@router.put("/{trade_id}", response_model=TradeResponse)
+async def update_trade_endpoint(
+    trade_id: uuid.UUID,
+    body: dict,
+    version: int = Query(..., description="Concurrent modification version lock"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update a trade."""
+    from app.db.crud_trade import update_trade
+    try:
+        return await update_trade(db, trade_id, current_user.id, version, body)
+    except NotImplementedError:
+        raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="Ledger rewriting requires complex FIFO reversal")
+
+
 @router.delete("/{trade_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def remove_trade(
     trade_id: uuid.UUID,

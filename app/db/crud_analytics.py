@@ -2,7 +2,7 @@ import uuid
 from datetime import date
 from typing import Sequence
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -104,6 +104,64 @@ async def get_user_daily_pnl(
     return result.scalars().all()
 
 
+async def backfill_daily_pnl(db: AsyncSession, user_id: uuid.UUID) -> int:
+    """Recompute daily_pnl rows from trades + realized_pnl for a given user.
+
+    Groups trades by (trade_date, segment), sums realized P&L for each date,
+    and upserts into daily_pnl. Returns the number of rows upserted.
+    """
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from app.models.trade import Trade
+
+    # 1. Get distinct (trade_date, segment) pairs for this user
+    date_seg_stmt = (
+        select(Trade.trade_date, Trade.segment, func.count().label("trade_count"))
+        .where(Trade.user_id == user_id)
+        .group_by(Trade.trade_date, Trade.segment)
+        .order_by(Trade.trade_date.asc())
+    )
+    date_seg_rows = (await db.execute(date_seg_stmt)).all()
+
+    upserted = 0
+
+    for row in date_seg_rows:
+        trade_date = row.trade_date
+        segment = (row.segment or "equity").lower()
+        trade_count = row.trade_count
+
+        # Sum realized net_pnl for sells on this date
+        pnl_stmt = (
+            select(func.coalesce(func.sum(RealizedPnl.net_pnl), 0))
+            .where(
+                RealizedPnl.user_id == user_id,
+                RealizedPnl.sell_date == trade_date,
+            )
+        )
+        daily_pnl_value = float((await db.execute(pnl_stmt)).scalar() or 0)
+
+        values = {
+            "id": uuid.uuid4(),
+            "user_id": user_id,
+            "trade_date": trade_date,
+            "pnl": daily_pnl_value,
+            "trade_count": trade_count,
+            "segment": segment,
+        }
+        stmt = pg_insert(DailyPnl).values(values)
+        stmt = stmt.on_conflict_do_update(
+            constraint="uq_daily_pnl_user_date_segment",
+            set_={
+                "pnl": stmt.excluded.pnl,
+                "trade_count": stmt.excluded.trade_count,
+            },
+        )
+        await db.execute(stmt)
+        upserted += 1
+
+    await db.commit()
+    return upserted
+
+
 # --------------- Daily Portfolio Snapshot ---------------
 
 async def create_portfolio_snapshot(db: AsyncSession, user_id: uuid.UUID, obj_in: PortfolioSnapshotCreate) -> DailyPortfolioSnapshot:
@@ -114,65 +172,121 @@ async def create_portfolio_snapshot(db: AsyncSession, user_id: uuid.UUID, obj_in
     return db_obj
 
 
-async def compute_and_save_snapshots(db: AsyncSession) -> int:
-    """Computes daily snapshot (total value, equity, cash) for all users and saves it."""
-    from sqlalchemy import func
-    from datetime import date
-    from app.models.holding import Holding
+async def backfill_portfolio_snapshots(db: AsyncSession, user_id: uuid.UUID, start_date: date, end_date: date) -> int:
+    """Historical snapshot reconstructor."""
+    from datetime import timedelta
+    from sqlalchemy.dialects.postgresql import insert
+    from app.models.trade import Trade
+    from app.models.cash_transaction import CashTransaction
+    from app.models.instrument import Instrument
     
-    # 1. Get all users
-    # We do a basic select of distinct user_ids from either holdings or funds_balance
-    stmt_users = select(FundsBalance.user_id).distinct()
-    res_users = await db.execute(stmt_users)
-    user_ids = res_users.scalars().all()
-    
-    today = date.today()
+    current_date = start_date
     created_count = 0
-    
-    for u_id in user_ids:
-        # Calculate Cash Balance
-        stmt_cash = select(
-            func.sum(FundsBalance.withdrawable_balance + FundsBalance.unsettled_credits).label("total_cash")
-        ).where(FundsBalance.user_id == u_id)
-        res_cash = await db.execute(stmt_cash)
-        total_cash = float(res_cash.scalar() or 0.0)
+    while current_date <= end_date:
+        # 1. Cash Balance up to date
+        cash_stmt = select(func.coalesce(func.sum(CashTransaction.amount), 0)).where(
+            CashTransaction.user_id == user_id, 
+            func.date(CashTransaction.timestamp) <= current_date
+        )
+        total_cash = float((await db.execute(cash_stmt)).scalar() or 0.0)
+
+        # 2. Holdings calculation as of date
+        trade_stmt = select(Trade).where(Trade.user_id == user_id, Trade.trade_date <= current_date)
+        trades = (await db.execute(trade_stmt)).scalars().all()
         
-        # Calculate Holdings Value
-        stmt_hold = select(
-            func.sum(Holding.current_value).label("equity_value"),
-            func.sum(Holding.quantity * Holding.avg_cost).label("invested")
-        ).where(Holding.user_id == u_id)
-        res_hold = await db.execute(stmt_hold)
-        row = res_hold.one_or_none()
-        equity_val = float(row.equity_value if row and row.equity_value else 0.0)
-        invest_val = float(row.invested if row and row.invested else 0.0)
+        holdings_qty = {}
+        holdings_cost = {}
         
-        # Snapshot row
-        # (Using Postgres insert to handle 'on_conflict_do_update' for idempotent daily runs)
-        from sqlalchemy.dialects.postgresql import insert
-        
+        # Realized PnL up to date
+        realized_stmt = select(func.coalesce(func.sum(RealizedPnl.net_pnl), 0)).where(
+            RealizedPnl.user_id == user_id,
+            RealizedPnl.sell_date <= current_date
+        )
+        total_realized_pnl = float((await db.execute(realized_stmt)).scalar() or 0.0)
+
+        for t in trades:
+            inst = t.instrument_id
+            if inst not in holdings_qty:
+                holdings_qty[inst] = 0.0
+                holdings_cost[inst] = 0.0
+                
+            if t.trade_type == "BUY":
+                holdings_qty[inst] += float(t.quantity)
+                holdings_cost[inst] += float(t.quantity * t.price)
+            elif t.trade_type == "SELL":
+                if holdings_qty[inst] > 0:
+                    avg_cost = holdings_cost[inst] / holdings_qty[inst]
+                    holdings_qty[inst] -= float(t.quantity)
+                    holdings_cost[inst] -= float(t.quantity) * avg_cost
+
+        # Calculate equity
+        total_invested = 0.0
+        total_unrealized_pnl = 0.0
+        equity_val = 0.0
+
+        for inst, qty in holdings_qty.items():
+            if qty > 0:
+                cost = holdings_cost[inst]
+                total_invested += cost
+                inst_stmt = select(Instrument.current_price).where(Instrument.id == inst)
+                current_price = float((await db.execute(inst_stmt)).scalar() or 0.0)
+                market_val = qty * current_price
+                equity_val += market_val
+                total_unrealized_pnl += (market_val - cost)
+
+        total_value = total_cash + equity_val
+        total_pnl = total_realized_pnl + total_unrealized_pnl
+
         values = {
             "id": uuid.uuid4(),
-            "user_id": u_id,
-            "snapshot_date": today,
-            "total_value": total_cash + equity_val,
-            "equity_value": equity_val,
+            "user_id": user_id,
+            "snapshot_date": current_date,
+            "total_value": total_value,
+            "total_invested": total_invested,
+            "total_realized_pnl": total_realized_pnl,
+            "total_unrealized_pnl": total_unrealized_pnl,
+            "total_pnl": total_pnl,
             "cash_balance": total_cash,
         }
-        
+
         stmt = insert(DailyPortfolioSnapshot).values(values)
         stmt = stmt.on_conflict_do_update(
             index_elements=["user_id", "snapshot_date"],
             set_= {
-                "total_value": stmt.excluded.total_value,
-                "equity_value": stmt.excluded.equity_value,
-                "cash_balance": stmt.excluded.cash_balance,
+                k: stmt.excluded[k] for k in ["total_value", "total_invested", "total_realized_pnl", "total_unrealized_pnl", "total_pnl", "cash_balance"]
             }
         )
         await db.execute(stmt)
+        
         created_count += 1
+        current_date += timedelta(days=1)
         
     await db.commit()
+    return created_count
+
+async def compute_and_save_snapshots(db: AsyncSession) -> int:
+    """Computes daily snapshot for all users using the backfill fast path in their local timezone."""
+    import pytz
+    from datetime import datetime
+    from app.models.user import User
+    
+    stmt_users = select(User)
+    res_users = await db.execute(stmt_users)
+    users = res_users.scalars().all()
+    
+    created_count = 0
+    
+    for u in users:
+        # Use user's specific timezone (default to UTC if missing/invalid)
+        try:
+            tz = pytz.timezone(u.timezone)
+        except Exception:
+            tz = pytz.UTC
+            
+        local_today = datetime.now(tz).date()
+        await backfill_portfolio_snapshots(db, u.id, local_today, local_today)
+        created_count += 1
+        
     return created_count
 
 

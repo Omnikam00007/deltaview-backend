@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.v1.deps import get_current_user
 from app.database import get_db
 from app.db.crud_analytics import (
-    create_daily_pnl, get_user_daily_pnl,
+    create_daily_pnl, get_user_daily_pnl, backfill_daily_pnl,
     create_portfolio_snapshot, get_user_portfolio_snapshots,
     create_realized_pnl, get_user_realized_pnl,
     get_user_tax_summary,
@@ -90,6 +90,30 @@ async def list_daily_pnl(
     """List daily P&L entries with optional filters."""
     return await get_user_daily_pnl(db, current_user.id, start_date=start_date, end_date=end_date, segment=segment)
 
+
+@router.post("/daily-pnl/backfill")
+async def backfill_daily_pnl_endpoint(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Recompute all daily P&L rows from historical trades for the current user."""
+    count = await backfill_daily_pnl(db, current_user.id)
+    return {"status": "ok", "rows_upserted": count}
+
+
+class DateRange(BaseModel):
+    start_date: date
+    end_date: date
+
+@router.post("/snapshots/backfill")
+async def backfill_snapshots_endpoint(
+    body: DateRange,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.db.crud_analytics import backfill_portfolio_snapshots
+    count = await backfill_portfolio_snapshots(db, current_user.id, body.start_date, body.end_date)
+    return {"status": "ok", "rows_upserted": count}
 
 # --------------- Portfolio Snapshots ---------------
 

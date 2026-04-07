@@ -20,6 +20,8 @@ class DailyPortfolioSnapshot(UUIDPrimaryKey, Base):
     snapshot_date: Mapped[date] = mapped_column(Date, nullable=False)
     total_value: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False)
     total_invested: Mapped[float | None] = mapped_column(Numeric(18, 2))
+    total_realized_pnl: Mapped[float | None] = mapped_column(Numeric(18, 2))
+    total_unrealized_pnl: Mapped[float | None] = mapped_column(Numeric(18, 2))
     total_pnl: Mapped[float | None] = mapped_column(Numeric(18, 2))
     cash_balance: Mapped[float | None] = mapped_column(Numeric(18, 2))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

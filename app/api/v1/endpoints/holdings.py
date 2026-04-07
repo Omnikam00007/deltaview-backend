@@ -39,8 +39,19 @@ async def add_holding(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Add a new holding to the portfolio."""
-    return await create_holding(db, current_user.id, body)
+    """Add a new holding to the portfolio AND automatically fetch its live price."""
+    from app.db.crud_holding import refresh_unrealized_pnl
+    
+    # 1. Create the holding in the database
+    holding = await create_holding(db, current_user.id, body)
+    
+    # 2. Immediately trigger price refresh for this user's holdings
+    await refresh_unrealized_pnl(db, current_user.id)
+    
+    # 3. Reload the holding object to get the newly calculated P&L fields
+    await db.refresh(holding, attribute_names=["instrument", "broker_account"])
+    
+    return holding
 
 
 @router.post("/sync", response_model=dict, status_code=status.HTTP_200_OK)

@@ -2,7 +2,7 @@ import uuid
 from datetime import date, datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Date, DateTime, ForeignKey, Index, Numeric, String, func
+from sqlalchemy import Date, DateTime, ForeignKey, Index, Numeric, String, func, Integer
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -34,6 +34,7 @@ class Trade(UUIDPrimaryKey, Base):
     segment: Mapped[str] = mapped_column(String(20), default="equity", nullable=False)
     charges: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)  # { brokerage, stt, gst, stamp_duty }
     raw_data: Mapped[dict | None] = mapped_column(JSONB)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     # Relationships

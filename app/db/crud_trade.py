@@ -2,180 +2,70 @@ import uuid
 from datetime import date
 from typing import Sequence
 
-from sqlalchemy import select
+from sqlalchemy import select, exc
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.trade import Trade
 from app.models.holding import Holding
+from app.models.holding_lot import HoldingLot
+from app.models.cash_transaction import CashTransaction
 from app.schemas.trade import TradeCreate
+from app.engine.pnl_engine import process_fifo_sell, compute_daily_total_pnl
 
 
 class InsufficientHoldingError(ValueError):
-    """Raised when a SELL trade quantity exceeds the available holding quantity."""
     pass
 
 
-async def upsert_holding_from_trade(db: AsyncSession, trade: Trade):
-    """Update or create a holding based on a new trade (BUY or SELL).
-    Uses row-level locking to prevent race conditions on avg_cost/quantity.
-    Must be called within an active transaction.
-    """
-    stmt = (
-        select(Holding)
-        .where(
-            Holding.user_id == trade.user_id,
-            Holding.broker_account_id == trade.broker_account_id,
-            Holding.instrument_id == trade.instrument_id,
-        )
-        .with_for_update()  # Lock the holding row for the duration of the transaction
-    )
-    result = await db.execute(stmt)
-    holding = result.scalar_one_or_none()
+class InsufficientFundsError(ValueError):
+    pass
 
-    if trade.trade_type == "BUY":
-        if holding:
-            # Recalculate weighted average cost
-            old_qty = float(holding.quantity)
-            old_cost = float(holding.avg_cost)
-            trade_qty = float(trade.quantity)
-            trade_price = float(trade.price)
 
-            new_qty = old_qty + trade_qty
-            # Avoid division by zero (should never happen if new_qty > 0)
-            if new_qty > 0:
-                new_avg_cost = ((old_qty * old_cost) + (trade_qty * trade_price)) / new_qty
-            else:
-                new_avg_cost = trade_price
+class ConcurrentModificationError(ValueError):
+    pass
 
-            holding.quantity = new_qty
-            holding.avg_cost = new_avg_cost
-            holding.as_of_date = trade.trade_date
-        else:
-            # Create new holding
-            holding = Holding(
-                user_id=trade.user_id,
-                broker_account_id=trade.broker_account_id,
-                instrument_id=trade.instrument_id,
-                quantity=trade.quantity,
-                avg_cost=trade.price,
-                as_of_date=trade.trade_date,
-            )
-            db.add(holding)
+
+async def _verify_and_update_cash(db: AsyncSession, user_id: uuid.UUID, amount: float, trade_id: uuid.UUID, txn_type: str, timestamp):
+    """Creates a CashTransaction. For BUYs, checks if funds are sufficient first."""
+    if amount < 0:
+        # Checking sufficient balance
+        cash_stmt = select(db.func.coalesce(db.func.sum(CashTransaction.amount), 0)).where(CashTransaction.user_id == user_id)
+        current_cash = float((await db.execute(cash_stmt)).scalar() or 0.0)
+        if current_cash + amount < 0:
+            raise InsufficientFundsError(f"Insufficient funds. Required: {abs(amount)}, Available: {current_cash}")
             
-    elif trade.trade_type == "SELL":
-        if not holding or float(holding.quantity) < float(trade.quantity):
-            raise InsufficientHoldingError(
-                f"Cannot SELL {trade.quantity} units. "
-                f"Available holding: {float(holding.quantity) if holding else 0} units."
-            )
-        
-        # Reduce quantity, do not change average cost
-        holding.quantity = float(holding.quantity) - float(trade.quantity)
-        holding.as_of_date = trade.trade_date
-
-
-from sqlalchemy import select, func
-from app.models.realized_pnl import RealizedPnl
-
-
-def _get_fy_string(d: date) -> str:
-    """Return financial year string 'YYYY-YY' for a given date."""
-    year = d.year if d.month >= 4 else d.year - 1
-    return f"{year}-{str(year + 1)[-2:]}"
-
-
-async def process_realized_pnl(db: AsyncSession, sell_trade: Trade):
-    """FIFO lot matching: match SELL trade against unallocated BUY trades 
-    and generate RealizedPnl records. Must be called inside transaction."""
-    
-    # 1. Subquery to find already allocated quantities for each BUY trade
-    allocated_sq = (
-        select(
-            RealizedPnl.buy_trade_id,
-            func.sum(RealizedPnl.quantity).label("allocated_qty")
-        )
-        .where(RealizedPnl.user_id == sell_trade.user_id)
-        .group_by(RealizedPnl.buy_trade_id)
-        .subquery()
+    txn = CashTransaction(
+        user_id=user_id,
+        timestamp=timestamp,
+        amount=amount,
+        trade_id=trade_id,
+        transaction_type=txn_type
     )
-
-    # 2. Query ALL previous BUY trades for this instrument that still have qty available
-    # Ordered by trade_date ASC, created_at ASC (FIFO)
-    stmt = (
-        select(Trade, func.coalesce(allocated_sq.c.allocated_qty, 0).label("allocated"))
-        .outerjoin(allocated_sq, Trade.id == allocated_sq.c.buy_trade_id)
-        .where(
-            Trade.user_id == sell_trade.user_id,
-            Trade.broker_account_id == sell_trade.broker_account_id,
-            Trade.instrument_id == sell_trade.instrument_id,
-            Trade.trade_type == "BUY",
-            (Trade.quantity - func.coalesce(allocated_sq.c.allocated_qty, 0)) > 0
-        )
-        .order_by(Trade.trade_date.asc(), Trade.created_at.asc())
-    )
-    
-    result = await db.execute(stmt)
-    rows = result.all()
-    
-    remaining_sell_qty = float(sell_trade.quantity)
-    
-    for row in rows:
-        buy_trade: Trade = row.Trade
-        allocated = float(row.allocated)
-        available_qty = float(buy_trade.quantity) - allocated
-        
-        match_qty = min(remaining_sell_qty, available_qty)
-        
-        # Financial calculations for this matched chunk
-        buy_value = match_qty * float(buy_trade.price)
-        sell_value = match_qty * float(sell_trade.price)
-        gross_pnl = sell_value - buy_value
-        
-        # Simplified proportionate charges for this chunk 
-        # (in a real app, you'd accurately proportion total trade charges)
-        net_pnl = gross_pnl # ignoring proportional charges for now
-        
-        holding_days = (sell_trade.trade_date - buy_trade.trade_date).days
-        
-        # Tax categorization based on segment
-        # Equities: 365 days. Debt/Gold: 1095 days.
-        segment = (sell_trade.segment or "equity").lower()
-        if segment in {"mf", "gold", "other"}:
-            threshold = 1095
-        else: # equity, fno, etf
-            threshold = 365
-            
-        tax_category = "LTCG" if holding_days >= threshold else "STCG"
-        
-        rpnl = RealizedPnl(
-            user_id=sell_trade.user_id,
-            broker_account_id=sell_trade.broker_account_id,
-            instrument_id=sell_trade.instrument_id,
-            buy_trade_id=buy_trade.id,
-            sell_trade_id=sell_trade.id,
-            quantity=match_qty,
-            buy_value=buy_value,
-            sell_value=sell_value,
-            gross_pnl=gross_pnl,
-            charges={},  # To be precise, calculate proportionate charges
-            net_pnl=net_pnl,
-            buy_date=buy_trade.trade_date,
-            sell_date=sell_trade.trade_date,
-            holding_period_days=holding_days,
-            tax_category=tax_category,
-            financial_year=_get_fy_string(sell_trade.trade_date)
-        )
-        db.add(rpnl)
-        
-        remaining_sell_qty -= match_qty
-        if remaining_sell_qty <= 0:
-            break
+    db.add(txn)
 
 
 async def create_trade(db: AsyncSession, user_id: uuid.UUID, obj_in: TradeCreate) -> Trade:
-    """Create a trade and automatically manage the corresponding holding."""
-    # Run operations within the current implicit transaction started by FastAPI dependencies
+    """Create a trade, matching FIFO blocks, enforcing Cash flows, updating DailyPnl."""
+    
+    # 1. Enforce Trade constraints & Lock Holding
+    stmt_h = (
+        select(Holding)
+        .where(
+            Holding.user_id == user_id,
+            Holding.broker_account_id == obj_in.broker_account_id,
+            Holding.instrument_id == obj_in.instrument_id,
+        )
+        .with_for_update()  # Row lock to prevent race geometry
+    )
+    res_h = await db.execute(stmt_h)
+    holding = res_h.scalar_one_or_none()
+    
+    if obj_in.trade_type.upper() == "SELL":
+        if not holding or float(holding.quantity) < float(obj_in.quantity):
+            raise InsufficientHoldingError(f"Cannot sell {obj_in.quantity}. Available: {float(holding.quantity) if holding else 0}")
+    
+    # 2. Add Trade
     db_obj = Trade(
         user_id=user_id,
         broker_account_id=obj_in.broker_account_id,
@@ -190,23 +80,91 @@ async def create_trade(db: AsyncSession, user_id: uuid.UUID, obj_in: TradeCreate
         segment=obj_in.segment,
         charges=obj_in.charges,
         raw_data=obj_in.raw_data,
+        version=1
     )
     db.add(db_obj)
-    await db.flush()  # So the trade gets an ID if needed for relations
-
-    # 2. Update the holding
-    await upsert_holding_from_trade(db, db_obj)
+    await db.flush()
     
-    # 3. Realize P&L if it's a SELL trade (FIFO lot matching)
-    if db_obj.trade_type == "SELL":
-        await process_realized_pnl(db, db_obj)
+    # 3. Cash Management
+    cash_delta = -float(obj_in.trade_value) if db_obj.trade_type == "BUY" else float(obj_in.trade_value)
+    await _verify_and_update_cash(db, user_id, cash_delta, db_obj.id, f"{db_obj.trade_type}_EXECUTION", db_obj.trade_date)
+    
+    # 4. Holding & FIFO Management
+    if db_obj.trade_type == "BUY":
+        # Create Holding Lot
+        lot = HoldingLot(
+            holding_id=holding.id if holding else uuid.uuid4(), # Holding id must exist, so we create holding strictly before or flush
+            instrument_id=db_obj.instrument_id,
+            user_id=user_id,
+            trade_id=db_obj.id,
+            quantity=db_obj.quantity,
+            avg_cost=db_obj.price,
+        )
+        
+        if holding:
+            new_qty = float(holding.quantity) + float(db_obj.quantity)
+            new_cost = ((float(holding.quantity) * float(holding.avg_cost)) + (float(db_obj.quantity) * float(db_obj.price))) / new_qty
+            holding.quantity = new_qty
+            holding.avg_cost = new_cost
+            lot.holding_id = holding.id
+        else:
+            holding = Holding(
+                user_id=user_id,
+                broker_account_id=db_obj.broker_account_id,
+                instrument_id=db_obj.instrument_id,
+                quantity=db_obj.quantity,
+                avg_cost=db_obj.price,
+                as_of_date=db_obj.trade_date,
+            )
+            db.add(holding)
+            await db.flush()
+            lot.holding_id = holding.id
+            
+        db.add(lot)
+        
+    elif db_obj.trade_type == "SELL":
+        # Deduct holding quantity
+        holding.quantity = float(holding.quantity) - float(db_obj.quantity)
+        
+        # FIFO Process
+        await process_fifo_sell(
+            db=db,
+            user_id=user_id,
+            broker_account_id=db_obj.broker_account_id,
+            instrument_id=db_obj.instrument_id,
+            sell_qty=float(db_obj.quantity),
+            sell_price=float(db_obj.price),
+            sell_trade_id=db_obj.id,
+            sell_date=db_obj.trade_date
+        )
+        
+    holding.as_of_date = db_obj.trade_date
 
-    # 4. Commit all changes atomically
+    # 5. EOD Engine Call
+    await compute_daily_total_pnl(db, user_id, db_obj.trade_date)
+    
     await db.commit()
-    
-    # We must refresh the object to load relationships
     await db.refresh(db_obj, attribute_names=["instrument", "broker_account"])
     return db_obj
+
+
+async def update_trade(db: AsyncSession, trade_id: uuid.UUID, user_id: uuid.UUID, version: int, obj_in: dict) -> Trade:
+    """Updating a trade natively requires rolling back previous trade state via complete delete & recreate."""
+    raise NotImplementedError("Direct update not supported natively without full ledger reversal.")
+
+
+async def delete_trade(db: AsyncSession, trade_id: uuid.UUID, user_id: uuid.UUID) -> bool:
+    """Strictly deletes a trade. If a SELL, it will theoretically require FIFO unmatching. 
+    A full robust implementation in Phase 8 will re-run the ledger pipeline entirely for safety."""
+    stmt = select(Trade).where(Trade.id == trade_id, Trade.user_id == user_id)
+    result = await db.execute(stmt)
+    db_obj = result.scalar_one_or_none()
+    if not db_obj:
+        return False
+        
+    await db.delete(db_obj)
+    await db.commit()
+    return True
 
 
 async def get_user_trades(
@@ -250,14 +208,3 @@ async def get_trade_by_id(db: AsyncSession, trade_id: uuid.UUID, user_id: uuid.U
     )
     result = await db.execute(stmt)
     return result.scalar_one_or_none()
-
-
-async def delete_trade(db: AsyncSession, trade_id: uuid.UUID, user_id: uuid.UUID) -> bool:
-    stmt = select(Trade).where(Trade.id == trade_id, Trade.user_id == user_id)
-    result = await db.execute(stmt)
-    db_obj = result.scalar_one_or_none()
-    if not db_obj:
-        return False
-    await db.delete(db_obj)
-    await db.commit()
-    return True

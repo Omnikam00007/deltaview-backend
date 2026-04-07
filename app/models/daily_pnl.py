@@ -17,7 +17,9 @@ class DailyPnl(UUIDPrimaryKey, Base):
 
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     trade_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
-    pnl: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False, default=0)
+    realized_pnl: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False, default=0)
+    unrealized_pnl: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False, default=0)
+    total_pnl: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False, default=0)
     trade_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     segment: Mapped[str] = mapped_column(String(20), default="equity", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

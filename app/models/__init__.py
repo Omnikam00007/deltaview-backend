@@ -12,6 +12,8 @@ from app.models.funds_balance import FundsBalance
 from app.models.bank_account import BankAccount
 from app.models.fund_transaction import FundTransaction
 from app.models.holding_tag import HoldingTag
+from app.models.cash_transaction import CashTransaction
+from app.models.holding_lot import HoldingLot
 
 __all__ = [
     "User",
@@ -27,4 +29,6 @@ __all__ = [
     "BankAccount",
     "FundTransaction",
     "HoldingTag",
+    "CashTransaction",
+    "HoldingLot",
 ]
