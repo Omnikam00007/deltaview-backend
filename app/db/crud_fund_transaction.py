@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.fund_transaction import FundTransaction
 from app.models.funds_balance import FundsBalance
 from app.models.ledger_entry import LedgerEntry
+from app.models.cash_transaction import CashTransaction
 from app.schemas.fund_transaction import FundTransactionCreate
 
 
@@ -109,6 +110,16 @@ async def create_fund_transaction(db: AsyncSession, user_id: uuid.UUID, obj_in: 
         transaction_ref=db_obj.transaction_ref,
     )
     db.add(ledger)
+
+    # ── 6. Update the Trade Engine Native Ledger (CashTransaction) ──
+    cash_amount = obj_in.amount if obj_in.transaction_type == "add" else -obj_in.amount
+    cash_txn = CashTransaction(
+        user_id=user_id,
+        timestamp=now,
+        amount=cash_amount,
+        transaction_type="DEPOSIT" if obj_in.transaction_type == "add" else "WITHDRAWAL",
+    )
+    db.add(cash_txn)
 
     await db.flush()
     await db.refresh(db_obj)
