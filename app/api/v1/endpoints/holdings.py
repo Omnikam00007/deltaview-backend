@@ -16,10 +16,12 @@ from app.db.crud_holding import (
     get_portfolio_summary,
     get_user_holding_tags,
     get_user_holdings,
+    get_user_holdings_consolidated,
     update_holding,
 )
 from app.models.user import User
 from app.schemas.holding import (
+    ConsolidatedHoldingResponse,
     HoldingCreate,
     HoldingResponse,
     HoldingTagCreate,
@@ -76,13 +78,21 @@ async def refresh_user_prices(
     return {"message": "success", "updated_count": updated_count}
 
 
-@router.get("/", response_model=List[HoldingResponse])
+@router.get("/")
 async def list_holdings(
     broker_account_id: uuid.UUID | None = Query(None, description="Filter by broker account"),
+    consolidated: bool = Query(True, description="Aggregate holdings by instrument across brokers"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """List all holdings for the current user, optionally filtered by broker."""
+    """List all holdings for the current user.
+
+    By default returns consolidated holdings (one row per stock, aggregated
+    across broker accounts, zero-quantity positions excluded).
+    Pass ?consolidated=false to get the raw per-lot rows.
+    """
+    if consolidated and not broker_account_id:
+        return await get_user_holdings_consolidated(db, current_user.id)
     return await get_user_holdings(db, current_user.id, broker_account_id)
 
 

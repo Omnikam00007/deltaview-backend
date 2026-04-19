@@ -2,7 +2,7 @@ import uuid
 from datetime import date
 from typing import Sequence
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, asc, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -143,7 +143,9 @@ async def backfill_daily_pnl(db: AsyncSession, user_id: uuid.UUID) -> int:
             "id": uuid.uuid4(),
             "user_id": user_id,
             "trade_date": trade_date,
-            "pnl": daily_pnl_value,
+            "realized_pnl": daily_pnl_value,
+            "unrealized_pnl": 0, # Backfill doesn't compute historic M2M yet
+            "total_pnl": daily_pnl_value,
             "trade_count": trade_count,
             "segment": segment,
         }
@@ -151,7 +153,8 @@ async def backfill_daily_pnl(db: AsyncSession, user_id: uuid.UUID) -> int:
         stmt = stmt.on_conflict_do_update(
             constraint="uq_daily_pnl_user_date_segment",
             set_={
-                "pnl": stmt.excluded.pnl,
+                "realized_pnl": stmt.excluded.realized_pnl,
+                "total_pnl": stmt.excluded.total_pnl,
                 "trade_count": stmt.excluded.trade_count,
             },
         )
@@ -173,43 +176,87 @@ async def create_portfolio_snapshot(db: AsyncSession, user_id: uuid.UUID, obj_in
 
 
 async def backfill_portfolio_snapshots(db: AsyncSession, user_id: uuid.UUID, start_date: date, end_date: date) -> int:
-    """Historical snapshot reconstructor."""
+    """
+    Optimized historical snapshot reconstructor.
+    Uses an in-memory accumulation strategy to avoid N+1 queries.
+    """
     from datetime import timedelta
     from sqlalchemy.dialects.postgresql import insert
     from app.models.trade import Trade
     from app.models.cash_transaction import CashTransaction
-    from app.models.instrument import Instrument
+    from app.models.holding import Holding
+    from app.models.realized_pnl import RealizedPnl
+    
+    # 1. Fetch current prices (LTP) from Holdings as the fallback market price
+    # NOTE: True historical pricing requires a dedicated price history table.
+    price_stmt = select(Holding.instrument_id, Holding.ltp).where(Holding.user_id == user_id)
+    prices = {row.instrument_id: float(row.ltp or 0.0) for row in (await db.execute(price_stmt)).all()}
+
+    # 2. Pre-fetch all event data sorted by date
+    # trades
+    trades_stmt = select(Trade).where(Trade.user_id == user_id).order_by(asc(Trade.trade_date))
+    all_trades = (await db.execute(trades_stmt)).scalars().all()
+    
+    # cash transactions
+    cash_stmt = select(CashTransaction).where(CashTransaction.user_id == user_id).order_by(asc(CashTransaction.timestamp))
+    all_cash = (await db.execute(cash_stmt)).scalars().all()
+    
+    # realized pnl
+    realized_stmt = select(RealizedPnl).where(RealizedPnl.user_id == user_id).order_by(asc(RealizedPnl.sell_date))
+    all_realized = (await db.execute(realized_stmt)).scalars().all()
+
+    # 3. Initialization for the running state
+    holdings_qty = {}
+    holdings_cost = {}
+    total_cash = 0.0
+    total_realized_pnl = 0.0
+    
+    # Pointers to current processing items
+    trade_idx = 0
+    cash_idx = 0
+    realized_idx = 0
     
     current_date = start_date
+    # Pre-calculate state up to start_date - 1 (exclusive) to initialize correctly
+    # If start_date is historical, we start from zero.
+    
+    # Efficiently catch up state to just before start_date
+    while trade_idx < len(all_trades) and all_trades[trade_idx].trade_date < start_date:
+        t = all_trades[trade_idx]
+        inst = t.instrument_id
+        if inst not in holdings_qty: holdings_qty[inst] = 0.0; holdings_cost[inst] = 0.0
+        if t.trade_type == "BUY":
+            holdings_qty[inst] += float(t.quantity)
+            holdings_cost[inst] += float(t.quantity * t.price)
+        elif t.trade_type == "SELL":
+            if holdings_qty[inst] > 0:
+                avg_cost = holdings_cost[inst] / holdings_qty[inst]
+                holdings_qty[inst] -= float(t.quantity)
+                holdings_cost[inst] -= float(t.quantity) * avg_cost
+        trade_idx += 1
+
+    while cash_idx < len(all_cash) and all_cash[cash_idx].timestamp.date() < start_date:
+        total_cash += float(all_cash[cash_idx].amount)
+        cash_idx += 1
+        
+    while realized_idx < len(all_realized) and all_realized[realized_idx].sell_date < start_date:
+        total_realized_pnl += float(all_realized[realized_idx].net_pnl or 0)
+        realized_idx += 1
+
     created_count = 0
+    snapshots_to_upsert = []
+
+    # 4. Main loop through the date range
     while current_date <= end_date:
-        # 1. Cash Balance up to date
-        cash_stmt = select(func.coalesce(func.sum(CashTransaction.amount), 0)).where(
-            CashTransaction.user_id == user_id, 
-            func.date(CashTransaction.timestamp) <= current_date
-        )
-        total_cash = float((await db.execute(cash_stmt)).scalar() or 0.0)
-
-        # 2. Holdings calculation as of date
-        trade_stmt = select(Trade).where(Trade.user_id == user_id, Trade.trade_date <= current_date)
-        trades = (await db.execute(trade_stmt)).scalars().all()
-        
-        holdings_qty = {}
-        holdings_cost = {}
-        
-        # Realized PnL up to date
-        realized_stmt = select(func.coalesce(func.sum(RealizedPnl.net_pnl), 0)).where(
-            RealizedPnl.user_id == user_id,
-            RealizedPnl.sell_date <= current_date
-        )
-        total_realized_pnl = float((await db.execute(realized_stmt)).scalar() or 0.0)
-
-        for t in trades:
+        # Update state with today's events
+        while cash_idx < len(all_cash) and all_cash[cash_idx].timestamp.date() == current_date:
+            total_cash += float(all_cash[cash_idx].amount)
+            cash_idx += 1
+            
+        while trade_idx < len(all_trades) and all_trades[trade_idx].trade_date == current_date:
+            t = all_trades[trade_idx]
             inst = t.instrument_id
-            if inst not in holdings_qty:
-                holdings_qty[inst] = 0.0
-                holdings_cost[inst] = 0.0
-                
+            if inst not in holdings_qty: holdings_qty[inst] = 0.0; holdings_cost[inst] = 0.0
             if t.trade_type == "BUY":
                 holdings_qty[inst] += float(t.quantity)
                 holdings_cost[inst] += float(t.quantity * t.price)
@@ -218,24 +265,25 @@ async def backfill_portfolio_snapshots(db: AsyncSession, user_id: uuid.UUID, sta
                     avg_cost = holdings_cost[inst] / holdings_qty[inst]
                     holdings_qty[inst] -= float(t.quantity)
                     holdings_cost[inst] -= float(t.quantity) * avg_cost
+            trade_idx += 1
+            
+        while realized_idx < len(all_realized) and all_realized[realized_idx].sell_date == current_date:
+            total_realized_pnl += float(all_realized[realized_idx].net_pnl or 0)
+            realized_idx += 1
 
-        # Calculate equity
-        total_invested = 0.0
-        total_unrealized_pnl = 0.0
+        # Compute snapshot metrics
         equity_val = 0.0
-
+        total_invested = 0.0
         for inst, qty in holdings_qty.items():
-            if qty > 0:
+            if qty > 0.00001:
                 cost = holdings_cost[inst]
                 total_invested += cost
-                inst_stmt = select(Instrument.current_price).where(Instrument.id == inst)
-                current_price = float((await db.execute(inst_stmt)).scalar() or 0.0)
-                market_val = qty * current_price
-                equity_val += market_val
-                total_unrealized_pnl += (market_val - cost)
-
-        total_value = total_cash + equity_val
+                price = prices.get(inst, 0.0)
+                equity_val += (qty * price)
+        
+        total_unrealized_pnl = equity_val - total_invested
         total_pnl = total_realized_pnl + total_unrealized_pnl
+        total_value = total_cash + equity_val
 
         values = {
             "id": uuid.uuid4(),
@@ -248,7 +296,7 @@ async def backfill_portfolio_snapshots(db: AsyncSession, user_id: uuid.UUID, sta
             "total_pnl": total_pnl,
             "cash_balance": total_cash,
         }
-
+        
         stmt = insert(DailyPortfolioSnapshot).values(values)
         stmt = stmt.on_conflict_do_update(
             index_elements=["user_id", "snapshot_date"],

@@ -65,6 +65,26 @@ class HoldingResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class ConsolidatedHoldingResponse(BaseModel):
+    """A single stock row aggregated across all broker accounts."""
+    id: str
+    user_id: str
+    instrument_id: str
+    quantity: float
+    avg_cost: float
+    ltp: float | None = None
+    current_value: float | None = None
+    pnl: float | None = None
+    pnl_percent: float | None = None
+    as_of_date: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+    instrument: InstrumentBrief | None = None
+    brokers: list[BrokerAccountBrief] = []
+
+
+
 # --------------- Holding Tags ---------------
 
 class HoldingTagCreate(BaseModel):

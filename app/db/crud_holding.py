@@ -1,5 +1,6 @@
 import uuid
-from typing import Sequence
+from collections import defaultdict
+from typing import Any, Sequence
 
 from sqlalchemy import select, func, delete
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -176,6 +177,88 @@ async def get_user_holdings(
     return result.scalars().all()
 
 
+async def get_user_holdings_consolidated(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+) -> list[dict[str, Any]]:
+    """Return holdings grouped by instrument_id (one row per stock).
+
+    Aggregates across all broker accounts and filters out instruments
+    where the total remaining quantity is zero or negative.
+    """
+    stmt = (
+        select(Holding)
+        .where(Holding.user_id == user_id)
+        .options(selectinload(Holding.instrument), selectinload(Holding.broker_account))
+        .order_by(Holding.updated_at.desc())
+    )
+    result = await db.execute(stmt)
+    rows: Sequence[Holding] = result.scalars().all()
+
+    # Group by instrument_id
+    groups: dict[uuid.UUID, list[Holding]] = defaultdict(list)
+    for h in rows:
+        groups[h.instrument_id].append(h)
+
+    consolidated: list[dict[str, Any]] = []
+    for instrument_id, holdings in groups.items():
+        total_qty = sum(float(h.quantity) for h in holdings)
+        if total_qty <= 0:
+            continue  # fully sold — omit
+
+        total_cost = sum(float(h.quantity) * float(h.avg_cost) for h in holdings)
+        avg_cost = total_cost / total_qty
+
+        # Use the most recent non-null LTP
+        ltp = next((float(h.ltp) for h in holdings if h.ltp is not None), avg_cost)
+
+        current_value = total_qty * ltp
+        invested = total_qty * avg_cost
+        pnl = current_value - invested
+        pnl_percent = (pnl / invested * 100) if invested else 0.0
+
+        # Collect unique brokers
+        brokers: list[dict] = []
+        seen_broker_ids: set[uuid.UUID] = set()
+        for h in holdings:
+            if h.broker_account and h.broker_account_id not in seen_broker_ids:
+                seen_broker_ids.add(h.broker_account_id)
+                brokers.append({
+                    "id": str(h.broker_account.id),
+                    "broker": h.broker_account.broker,
+                    "broker_client_id": h.broker_account.broker_client_id,
+                })
+
+        # Pick the most recent as_of_date and updated_at
+        latest = holdings[0]  # already sorted desc by updated_at
+
+        consolidated.append({
+            "id": str(latest.id),  # representative id
+            "user_id": str(user_id),
+            "instrument_id": str(instrument_id),
+            "quantity": round(total_qty, 4),
+            "avg_cost": round(avg_cost, 4),
+            "ltp": round(ltp, 4),
+            "current_value": round(current_value, 2),
+            "pnl": round(pnl, 2),
+            "pnl_percent": round(pnl_percent, 4),
+            "as_of_date": str(latest.as_of_date),
+            "created_at": latest.created_at.isoformat() if latest.created_at else None,
+            "updated_at": latest.updated_at.isoformat() if latest.updated_at else None,
+            "instrument": {
+                "id": str(latest.instrument.id),
+                "symbol": latest.instrument.symbol,
+                "name": latest.instrument.name,
+                "exchange": latest.instrument.exchange,
+                "segment": latest.instrument.segment,
+                "sector": latest.instrument.sector,
+            } if latest.instrument else None,
+            "brokers": brokers,
+        })
+
+    return consolidated
+
+
 async def get_holding_by_id(db: AsyncSession, holding_id: uuid.UUID, user_id: uuid.UUID) -> Holding | None:
     stmt = (
         select(Holding)
@@ -279,7 +362,7 @@ async def get_portfolio_summary(db: AsyncSession, user_id: uuid.UUID) -> dict:
         func.sum(Holding.current_value).label("current_value"),
         func.sum(Holding.pnl).label("total_pnl"),
         func.count(Holding.id).label("holding_count"),
-    ).where(Holding.user_id == user_id)
+    ).where(Holding.user_id == user_id, Holding.quantity > 0)
     result = await db.execute(stmt)
     row = result.one()
 

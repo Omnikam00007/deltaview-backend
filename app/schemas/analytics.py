@@ -69,7 +69,9 @@ class FundsBalanceResponse(BaseModel):
 
 class DailyPnlCreate(BaseModel):
     trade_date: date
-    pnl: float = 0
+    realized_pnl: float = 0
+    unrealized_pnl: float = 0
+    total_pnl: float = 0
     trade_count: int = 0
     segment: str = "equity"
 
@@ -78,7 +80,9 @@ class DailyPnlResponse(BaseModel):
     id: uuid.UUID
     user_id: uuid.UUID
     trade_date: date
-    pnl: float
+    realized_pnl: float
+    unrealized_pnl: float
+    total_pnl: float
     trade_count: int
     segment: str
     created_at: datetime

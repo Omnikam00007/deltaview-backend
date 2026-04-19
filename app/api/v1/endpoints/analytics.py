@@ -2,7 +2,7 @@ import uuid
 from datetime import date
 from typing import List
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, status, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.deps import get_current_user
@@ -31,7 +31,7 @@ class LivePortfolioSummary(BaseModel):
 
 router = APIRouter()
 
-@router.get("/portfolio-live-summary", response_model=LivePortfolioSummary)
+@router.get("/summary", response_model=LivePortfolioSummary)
 async def get_portfolio_live_summary(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -129,12 +129,17 @@ async def add_portfolio_snapshot(
 
 @router.get("/snapshots", response_model=List[PortfolioSnapshotResponse])
 async def list_portfolio_snapshots(
+    response: Response,
     start_date: date | None = Query(None),
     end_date: date | None = Query(None),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """List portfolio snapshots for charting portfolio growth over time."""
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    
     return await get_user_portfolio_snapshots(db, current_user.id, start_date=start_date, end_date=end_date)
 
 

@@ -2,7 +2,7 @@ import uuid
 from datetime import date
 from typing import Sequence
 
-from sqlalchemy import select, exc
+from sqlalchemy import func, select, exc
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -30,7 +30,7 @@ async def _verify_and_update_cash(db: AsyncSession, user_id: uuid.UUID, amount: 
     """Creates a CashTransaction. For BUYs, checks if funds are sufficient first."""
     if amount < 0:
         # Checking sufficient balance
-        cash_stmt = select(db.func.coalesce(db.func.sum(CashTransaction.amount), 0)).where(CashTransaction.user_id == user_id)
+        cash_stmt = select(func.coalesce(func.sum(CashTransaction.amount), 0)).where(CashTransaction.user_id == user_id)
         current_cash = float((await db.execute(cash_stmt)).scalar() or 0.0)
         if current_cash + amount < 0:
             raise InsufficientFundsError(f"Insufficient funds. Required: {abs(amount)}, Available: {current_cash}")
