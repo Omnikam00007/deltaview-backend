@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.deps import get_current_user
 from app.database import get_db
-from app.db.crud_trade import create_trade, delete_trade, get_trade_by_id, get_user_trades, InsufficientHoldingError
+from app.db.crud_trade import create_trade, delete_trade, get_trade_by_id, get_user_trades, InsufficientHoldingError, InsufficientFundsError
 from app.models.user import User
 from app.schemas.trade import TradeCreate, TradeResponse
 
@@ -26,7 +26,7 @@ async def add_trade(
     
     try:
         return await create_trade(db, current_user.id, body)
-    except InsufficientHoldingError as e:
+    except (InsufficientHoldingError, InsufficientFundsError) as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
