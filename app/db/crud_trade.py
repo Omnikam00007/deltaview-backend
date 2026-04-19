@@ -87,6 +87,33 @@ async def create_trade(db: AsyncSession, user_id: uuid.UUID, obj_in: TradeCreate
     
     # 3. Cash Management
     cash_delta = -float(obj_in.trade_value) if db_obj.trade_type == "BUY" else float(obj_in.trade_value)
+    
+    # 3.1 Lock & Update Native Cash UI representation
+    from app.models.funds_balance import FundsBalance
+    stmt_bal = (
+        select(FundsBalance)
+        .where(FundsBalance.user_id == user_id, FundsBalance.broker_account_id == db_obj.broker_account_id)
+        .with_for_update()
+    )
+    balance = (await db.execute(stmt_bal)).scalar_one_or_none()
+    
+    if not balance:
+        balance = FundsBalance(
+            user_id=user_id,
+            broker_account_id=db_obj.broker_account_id,
+            available_margin=0,
+            withdrawable_balance=0,
+            unsettled_credits=0,
+            pledged_margin=0,
+            used_margin=0,
+            total_margin=0,
+        )
+        db.add(balance)
+        await db.flush()
+        
+    balance.available_margin = float(balance.available_margin) + cash_delta
+    balance.total_margin = float(balance.total_margin) + cash_delta
+
     await _verify_and_update_cash(db, user_id, cash_delta, db_obj.id, f"{db_obj.trade_type}_EXECUTION", db_obj.trade_date)
     
     # 4. Holding & FIFO Management
