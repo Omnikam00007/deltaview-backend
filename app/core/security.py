@@ -69,3 +69,49 @@ async def verify_password_reset_token(redis: Redis, token: str) -> str | None:
     if email:
         await redis.delete(key)  # single use — delete after verification
     return email
+
+
+# --------------- Registration Tokens (Redis-backed) ---------------
+
+import json
+
+_REGISTRATION_PREFIX = "registration_otp:"
+
+def _generate_otp() -> str:
+    """Generate a 6-digit OTP."""
+    return str(secrets.randbelow(900000) + 100000)
+
+async def create_registration_otp(redis: Redis, email: str, data: dict) -> str:
+    """Create a 6-digit OTP, store registration data in Redis with TTL (15 mins), return the OTP."""
+    otp = _generate_otp()
+    key = f"{_REGISTRATION_PREFIX}{email}"
+    # Store the payload and the OTP
+    payload = {
+        "otp": otp,
+        "data": data,
+    }
+    await redis.set(key, json.dumps(payload), ex=15 * 60)
+    return otp
+
+async def get_pending_registration(redis: Redis, email: str) -> dict | None:
+    """Fetch pending registration data, returning None if not found or expired."""
+    key = f"{_REGISTRATION_PREFIX}{email}"
+    raw = await redis.get(key)
+    if not raw:
+        return None
+    return json.loads(raw)
+
+async def verify_registration_otp(redis: Redis, email: str, otp: str) -> dict | None:
+    """Verify a registration OTP for a given email. Returns the user data or None if invalid/expired."""
+    key = f"{_REGISTRATION_PREFIX}{email}"
+    raw = await redis.get(key)
+    if not raw:
+        return None
+    
+    payload = json.loads(raw)
+    if payload.get("otp") == otp:
+        await redis.delete(key)  # single use — delete after successful verification
+        return payload.get("data")
+    
+    return None
+
