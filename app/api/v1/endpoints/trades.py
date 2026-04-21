@@ -10,6 +10,7 @@ from app.database import get_db
 from app.db.crud_trade import create_trade, delete_trade, get_trade_by_id, get_user_trades, InsufficientHoldingError, InsufficientFundsError
 from app.models.user import User
 from app.schemas.trade import TradeCreate, TradeResponse
+from app.tasks.sync import backfill_user_snapshots
 
 router = APIRouter()
 
@@ -23,11 +24,16 @@ async def add_trade(
     """Record a new trade."""
     if body.trade_type.upper() not in ("BUY", "SELL"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="trade_type must be 'BUY' or 'SELL'")
-    
+
     try:
-        return await create_trade(db, current_user.id, body)
+        trade = await create_trade(db, current_user.id, body)
     except (InsufficientHoldingError, InsufficientFundsError) as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    # Auto-backfill snapshots for this user in the background (idempotent)
+    backfill_user_snapshots.delay(str(current_user.id))
+
+    return trade
 
 
 @router.get("/", response_model=List[TradeResponse])
