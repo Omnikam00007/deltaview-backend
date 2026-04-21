@@ -2,7 +2,8 @@ import uuid
 from datetime import date
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status, BackgroundTasks
+from app.core.email import build_trade_notification_email, send_email
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.deps import get_current_user
@@ -18,6 +19,7 @@ router = APIRouter()
 @router.post("/", response_model=TradeResponse, status_code=status.HTTP_201_CREATED)
 async def add_trade(
     body: TradeCreate,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -32,6 +34,18 @@ async def add_trade(
 
     # Auto-backfill snapshots for this user in the background (idempotent)
     backfill_user_snapshots.delay(str(current_user.id))
+
+    # Send Notification Email asynchronously
+    symbol = trade.instrument.symbol if getattr(trade, 'instrument', None) else str(trade.instrument_id)
+    subject = f"Trade Executed: {trade.trade_type} {symbol}"
+    html_body = build_trade_notification_email(
+        trade_type=trade.trade_type,
+        quantity=float(trade.quantity),
+        symbol=symbol,
+        price=float(trade.price),
+        trade_value=float(trade.trade_value)
+    )
+    background_tasks.add_task(send_email, to=current_user.email, subject=subject, html_body=html_body)
 
     return trade
 

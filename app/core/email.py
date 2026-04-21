@@ -76,3 +76,41 @@ def build_password_reset_email(reset_link: str) -> str:
   </div>
 </body>
 </html>"""
+
+
+def build_trade_notification_email(trade_type: str, quantity: float, symbol: str, price: float, trade_value: float) -> str:
+    """Return a styled HTML email body for trade notifications."""
+    action_color = "#22c55e" if trade_type.upper() == "BUY" else "#ef4444"
+    return f"""\
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #0f0f23; color: #e2e8f0; margin: 0; padding: 0; }}
+    .container {{ max-width: 520px; margin: 40px auto; background: #1a1a2e; border-radius: 12px; padding: 40px; border: 1px solid #2d2d44; }}
+    h1 {{ color: #818cf8; font-size: 24px; margin-bottom: 8px; }}
+    p {{ color: #94a3b8; line-height: 1.6; font-size: 15px; }}
+    .highlight {{ color: {action_color}; font-weight: bold; }}
+    .details {{ background: #0f0f23; padding: 16px; border-radius: 8px; margin-top: 20px; }}
+    .details p {{ margin: 8px 0; }}
+    .footer {{ font-size: 12px; color: #475569; margin-top: 32px; border-top: 1px solid #2d2d44; padding-top: 16px; }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Trade Execution Notification</h1>
+    <p>A new <span class="highlight">{trade_type.upper()}</span> order has been successfully executed on your DeltaView account.</p>
+    
+    <div class="details">
+      <p><strong>Instrument:</strong> {symbol}</p>
+      <p><strong>Quantity:</strong> {quantity}</p>
+      <p><strong>Execution Price:</strong> ₹{price:,.2f}</p>
+      <p><strong>Total Value:</strong> ₹{trade_value:,.2f}</p>
+    </div>
+    
+    <div class="footer">
+      &copy; {settings.APP_NAME} &mdash; Portfolio Intelligence for Indian Investors
+    </div>
+  </div>
+</body>
+</html>"""
